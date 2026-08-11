@@ -68,9 +68,20 @@ abstract class Japscan :
 
     // Sometimes an adblock blocker will pop up, preventing the user from opening
     // a cloudflare protected page
-    private val internalBaseUrl = "https://www.japscan.foo"
+    private val internalBaseUrl by lazy {
+        baseUrl.toHttpUrl().let { "${it.scheme}://${it.host}" }
+    }
 
     override val supportsLatest = true
+
+    // The site's registrable domain, derived from internalBaseUrl so a domain rotation doesn't
+    // silently blackhole every request inside the capture WebView. Tiles are served from
+    // sibling subdomains (c4.japscan.foo, …), hence the domain rather than the host.
+    private val siteDomain by lazy { internalBaseUrl.toHttpUrl().host.removePrefix("www.") }
+
+    private val allowedHosts by lazy { ALLOWED_THIRD_PARTY_HOSTS + siteDomain }
+
+    private val cacheRoot by lazy { applicationContext.cacheDir.canonicalFile }
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
@@ -88,13 +99,22 @@ abstract class Japscan :
             val req = chain.request()
             if (req.url.host != JAPSCAN_CACHE_HOST) return@addInterceptor chain.proceed(req)
             val path = "/" + req.url.pathSegments.joinToString("/")
-            val bytes = runCatching { File(path).readBytes() }.getOrNull()
+            // Only ever serve our own spool files. These URLs are persisted with the page
+            // (download queue, chapter cache), so they outlive the run that produced them —
+            // constrain the path instead of trusting whoever hands it back to us.
+            val bytes = runCatching {
+                val file = File(path).canonicalFile
+                require(file.startsWith(cacheRoot) && file.name.startsWith(CACHE_FILE_PREFIX))
+                file.readBytes()
+            }.getOrNull()
             Response.Builder()
                 .request(req)
                 .protocol(Protocol.HTTP_1_1)
                 .code(if (bytes != null) 200 else 404)
                 .message(if (bytes != null) "OK" else "Not Found")
-                .body((bytes ?: ByteArray(0)).toResponseBody("image/jpeg".toMediaType()))
+                // The webtoon driver re-encodes to JPEG; the paginated one saves the
+                // descrambler's blob untouched, which may be PNG. Sniff rather than assume.
+                .body((bytes ?: ByteArray(0)).toResponseBody(bytes.imageMediaType()))
                 .build()
         }
         // rateLimit returns a RateLimitBuilder; it must come last as all other
@@ -168,6 +188,15 @@ abstract class Japscan :
         // WebView driver is wedged rather than merely slow.
         private const val IDLE_TIMEOUT_MS = 45_000L
 
+        // How long the in-page driver waits for the reader to mount before concluding
+        // this onPageFinished was a bare-document fire and standing down for the next one.
+        private const val READER_MOUNT_TIMEOUT_MS = 30_000L
+
+        // Ceiling for the spooled pages, and the grace period below which a file is
+        // assumed to belong to a read still in progress and is never reclaimed.
+        private const val MAX_PAGE_CACHE_BYTES = 256L * 1024 * 1024
+        private val CACHE_MIN_AGE_MS = TimeUnit.MINUTES.toMillis(10)
+
         // Captcha flow. Same values as the sibling ScanManga extension, which runs the
         // near-identical Cloudflare dance.
         private const val CF_POLL_INTERVAL_MS = 5000L
@@ -197,8 +226,7 @@ abstract class Japscan :
         // usrpubtrk.com, … — they change every few weeks) whose vignette and popunder
         // modals break the detached descrambler. A blocklist would rot, so allowlist
         // the handful of origins the reader actually needs and drop everything else.
-        private val ALLOWED_HOSTS = listOf(
-            "japscan.foo",
+        private val ALLOWED_THIRD_PARTY_HOSTS = listOf(
             "cdnjs.cloudflare.com",
             "code.jquery.com",
             "cdn.jsdelivr.net",
@@ -450,12 +478,12 @@ abstract class Japscan :
                 chapterNum == urlNum
             }
 
-        // Fall back to the unfiltered list in case the heuristics are too aggressive. There
-        // we prefer the longest URL — real slugs (e.g. "one-piece") are usually longer than
-        // honeypot slugs (e.g. "cv"). The binding above admits at most one URL per row, so
-        // nothing needs ordering on the normal path.
+        // No fallback to the unfiltered list: it would fire precisely when the slug/number
+        // binding rejected every candidate, which is the situation where a honeypot is the
+        // likely sole survivor — "longest slug wins" is a coin flip there. chapterListParse
+        // mapNotNull's this throw, so an unbindable row is dropped rather than poisoning the
+        // list with a decoy.
         val foundPair = filtered.firstOrNull()
-            ?: allUrlPairs.maxByOrNull { it.second.length }
             ?: throw Exception("Impossible de trouver l'URL du chapitre")
 
         val chapter = SChapter.create()
@@ -480,7 +508,7 @@ abstract class Japscan :
 
         val handler = Handler(Looper.getMainLooper())
         val latch = CountDownLatch(1)
-        val jsInterface = JsInterface(latch, context.cacheDir)
+        val jsInterface = JsInterface(latch, context.cacheDir, interfaceName)
         var webView: WebView? = null
 
         // The probe body is never reused — the WebView re-fetches the chapter itself — so
@@ -527,7 +555,10 @@ abstract class Japscan :
                         component = ComponentName(context, targetClass)
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                     }
-                    context.startActivity(closeIntent)
+                    // Best-effort: a fork may ship WebViewActivity under this name but not
+                    // the reader/main classes. The captcha is already solved at this point,
+                    // so failing to dismiss the WebView must not fail the chapter.
+                    runCatching { context.startActivity(closeIntent) }
                     break
                 }
             }
@@ -611,7 +642,7 @@ abstract class Japscan :
                     request: WebResourceRequest,
                 ): WebResourceResponse? {
                     val host = request.url.host ?: return null
-                    val allowed = ALLOWED_HOSTS.any { host == it || host.endsWith(".$it") }
+                    val allowed = allowedHosts.any { host == it || host.endsWith(".$it") }
                     // Empty stream rather than a null one: a null body makes some WebView
                     // builds keep the request pending, which would stall the whole capture.
                     return if (allowed) {
@@ -914,11 +945,34 @@ abstract class Japscan :
                             $$"""
                                 (async function(){
                                     // onPageFinished fires more than once per load (redirects,
-                                    // iframes, in-page navigations). Without this guard a second
-                                    // driver races the first and saves every page twice.
-                                    if (window.__japscanDriverStarted) return;
-                                    window.__japscanDriverStarted = true;
+                                    // iframes, in-page navigations), and the first fire is often
+                                    // the bare document — served straight from the WebView HTTP
+                                    // cache when the user spent a while on the captcha — before
+                                    // any reader script has run. Claiming the run there would lock
+                                    // out the real load, so wait for the reader to mount and only
+                                    // then take the claim. __japscanDriverWaiting keeps concurrent
+                                    // fires from stacking up waiters.
+                                    if (window.__japscanDriverStarted || window.__japscanDriverWaiting) return;
+                                    window.__japscanDriverWaiting = true;
                                     var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
+
+                                    var readerMounted = false;
+                                    var readyDeadline = Date.now() + $$READER_MOUNT_TIMEOUT_MS;
+                                    while (Date.now() < readyDeadline) {
+                                        if (document.getElementById('pages') ||
+                                            document.getElementById('block-right') ||
+                                            document.querySelector('#full-reader div[id^="d-img-"]')) {
+                                            readerMounted = true;
+                                            break;
+                                        }
+                                        await sleep(250);
+                                    }
+                                    window.__japscanDriverWaiting = false;
+                                    if (!readerMounted) {
+                                        console.log('[japscan] reader never mounted, leaving the claim open');
+                                        return;
+                                    }
+                                    window.__japscanDriverStarted = true;
 
                                     async function saveBlobUrl(u){
                                         if (!u) return false;
@@ -1036,11 +1090,34 @@ abstract class Japscan :
                         $$"""
                             (async function(){
                                 // onPageFinished fires more than once per load (redirects,
-                                // iframes, in-page navigations). Without this guard a second
-                                // driver races the first and saves every tile twice.
-                                if (window.__japscanDriverStarted) return;
-                                window.__japscanDriverStarted = true;
+                                // iframes, in-page navigations), and the first fire is often
+                                // the bare document — served straight from the WebView HTTP
+                                // cache when the user spent a while on the captcha — before
+                                // any reader script has run. Claiming the run there would lock
+                                // out the real load, so wait for the reader to mount and only
+                                // then take the claim. __japscanDriverWaiting keeps concurrent
+                                // fires from stacking up waiters.
+                                if (window.__japscanDriverStarted || window.__japscanDriverWaiting) return;
+                                window.__japscanDriverWaiting = true;
                                 var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
+
+                                var readerMounted = false;
+                                var readyDeadline = Date.now() + $$READER_MOUNT_TIMEOUT_MS;
+                                while (Date.now() < readyDeadline) {
+                                    if (document.querySelector('#full-reader div[id^="d-img-"]') ||
+                                        document.getElementById('pages') ||
+                                        document.getElementById('block-right')) {
+                                        readerMounted = true;
+                                        break;
+                                    }
+                                    await sleep(250);
+                                }
+                                window.__japscanDriverWaiting = false;
+                                if (!readerMounted) {
+                                    window.__jlog('[japscan] reader never mounted, leaving the claim open');
+                                    return;
+                                }
+                                window.__japscanDriverStarted = true;
                                 window.__jlog('[japscan] driver start');
 
                                 // Collect every <canvas> reachable from `root`, descending
@@ -1323,7 +1400,10 @@ abstract class Japscan :
                                 // work; if this ever fires, the fix is to reload the WebView with
                                 // the paginated hooks, not a third capture technique.
                                 window.__jlog('[japscan] MISMATCH: url hinted webtoon but the DOM mounted the paginated reader — giving up');
-                                try { window.$$interfaceName.passDone(); } catch(e) {}
+                                // Deliberately no passDone() here: counting the latch down would
+                                // return an empty page list and report it as a successful load,
+                                // turning a hard failure into a silently blank chapter. Letting
+                                // the Kotlin side time out surfaces an honest error instead.
                             })();
                         """.trimIndent(),
                     ) { result -> debugLog("[wv-kt] driver eval result=$result") }
@@ -1332,6 +1412,12 @@ abstract class Japscan :
 
             innerWv.loadUrl(chapterUrl, headers.toMap())
         }
+
+        // The idle clock only starts here. Everything above — the captcha probe, the
+        // warmup, and up to CF_MAX_POLLS * CF_POLL_INTERVAL_MS of waiting for the user
+        // to solve the challenge — happens before the WebView has loaded anything, and
+        // counting it as driver inactivity aborts healthy captures on any slow solve.
+        jsInterface.markStarted()
 
         // Generous ceiling: the JS sequentially drives every page through the
         // reader's pagination and waits for each blob, which can easily exceed
@@ -1350,13 +1436,20 @@ abstract class Japscan :
         }
         handler.post { webView?.destroy() }
 
-        if (latch.count == 1L) {
-            throw Exception("Erreur lors de la récupération des pages")
-        }
         // Wrap each absolute cache path in the sentinel host so OkHttp accepts it
         // and our interceptor serves the file. Paths under /data/data/... are
         // already URL-safe (alphanumerics, dots, slashes, hyphens).
-        val images = jsInterface.snapshot()
+        val captured = jsInterface.snapshot()
+
+        // Keep whatever the driver managed to capture rather than discarding a nearly
+        // complete chapter because the run ended on a timeout instead of passDone().
+        // Only a run that produced nothing at all is reported as a failure, and it says
+        // so plainly — an empty list here would surface as a blank chapter.
+        if (captured.isEmpty()) {
+            throw Exception("Aucune page n'a pu être récupérée pour ce chapitre.")
+        }
+
+        val images = captured
             .mapIndexed { i, path -> Page(i, imageUrl = "https://$JAPSCAN_CACHE_HOST$path") }
         return Observable.just(images)
     }
@@ -1438,9 +1531,26 @@ abstract class Japscan :
     // next chapter's page list while the current chapter is still open, so this runs with
     // an in-progress read's files on disk and must not touch them.
     private fun sweepPageCache(cacheDir: File) {
-        val cutoff = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24)
-        cacheDir.listFiles()?.forEach {
-            if (it.name.startsWith(CACHE_FILE_PREFIX) && it.lastModified() < cutoff) it.delete()
+        val now = System.currentTimeMillis()
+        val ageCutoff = now - TimeUnit.HOURS.toMillis(24)
+        val spool = cacheDir.listFiles()
+            ?.filter { it.name.startsWith(CACHE_FILE_PREFIX) }
+            ?: return
+
+        val survivors = spool.filterNot { it.lastModified() < ageCutoff && it.delete() }
+
+        // Age alone let the spool reach hundreds of MB across a reading session — one
+        // chapter measured 111 files / 12.4 MB. Trim oldest-first back to a budget so
+        // Android is less likely to evict the directory out from under an active read.
+        // Anything recent is off-limits: a preloaded chapter is still legitimately in use.
+        var total = survivors.sumOf { it.length() }
+        if (total <= MAX_PAGE_CACHE_BYTES) return
+        val recentCutoff = now - CACHE_MIN_AGE_MS
+        for (file in survivors.sortedBy { it.lastModified() }) {
+            if (total <= MAX_PAGE_CACHE_BYTES) break
+            if (file.lastModified() > recentCutoff) continue
+            val size = file.length()
+            if (file.delete()) total -= size
         }
     }
 
@@ -1452,14 +1562,29 @@ abstract class Japscan :
     internal class JsInterface(
         private val latch: CountDownLatch,
         private val cacheDir: File,
+        sessionId: String,
     ) {
         // Last time the driver made progress, for fetchPageList's idle watchdog.
         @Volatile
         var lastActivity: Long = System.currentTimeMillis()
             private set
 
+        /**
+         * Restarts the idle clock. The captcha phase runs between construction and the
+         * first capture and can take tens of seconds, which would otherwise be counted
+         * against the driver's idle budget before it has loaded a single byte.
+         */
+        fun markStarted() {
+            lastActivity = System.currentTimeMillis()
+        }
+
         private val savedPaths = mutableListOf<String>()
-        private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}"
+
+        // The reader preloads the next chapter's page list while the current one is open,
+        // so two fetchPageList calls overlap routinely. A timestamp alone collides when
+        // both start in the same millisecond and each would overwrite the other's tiles,
+        // hence the per-call random id.
+        private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}-$sessionId"
 
         // Absolute file paths in the app's cache dir, in capture order.
         fun snapshot(): List<String> = synchronized(savedPaths) { savedPaths.toList() }
@@ -1496,3 +1621,10 @@ abstract class Japscan :
         }
     }
 }
+
+private val PNG_MAGIC = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47)
+
+private fun ByteArray?.imageMediaType() = when {
+    this != null && size >= 4 && copyOfRange(0, 4).contentEquals(PNG_MAGIC) -> "image/png"
+    else -> "image/jpeg"
+}.toMediaType()
